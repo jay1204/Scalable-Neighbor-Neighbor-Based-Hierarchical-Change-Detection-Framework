@@ -1,0 +1,546 @@
+/*
+ * Nearest Neighbor Based Hierarchical Change Detection Framework
+ *
+ * Created by Zexi Chen(zchen22)
+ * Contributors: Zexi Chen, Qiang Zhang
+ * Date: 2/24/2016
+ *
+ */
+
+
+#include <cuda.h>
+//#include "getDeviceInfo.h"
+//#include <bitset>
+#include "FileOperator.h"
+#include <math.h>
+#include <ctime>
+#include <cfloat>
+#include "Hierarchical_clustering.h"
+
+/*
+ * tool functions
+ */
+__device__ float minTriple(float a, float b, float c){
+	float min = a<=b?a:b;
+	return min<=c?min:c;
+}
+
+__device__ float myabs(float a,float b){
+    return a>=b?(a-b):(b-a);
+}
+
+__device__ float mymax(float a, float b){
+	return a>=b?a:b;
+}
+
+/*
+ * calculate the euclidean distance(input type uchar)
+ */
+__device__ float euclideanDist(uchar *array1, float *array2, int length){
+	float total = 0;
+	for(int i=0;i<length;i++)
+		total += ((float)array1[i]-array2[i])*((float)array1[i]-array2[i]);
+    return sqrt(total);
+}
+
+/* 
+ * DTW with constraint window size(input type uchar)
+ */
+__device__ float dtw(uchar *array1, float *array2, float mat[][BAND_NUM+1], int winSize){
+
+	for(int i = 0; i <= BAND_NUM; i++){
+	    for(int j = 0; j <= BAND_NUM; j++){
+	        mat[i][j]=FLT_MAX;
+	    }
+	}
+
+    mat[0][0] = 0;
+	
+	for(int i = 1; i <= BAND_NUM; i++){
+		int start = 1>=(i-winSize)?1:(i-winSize);
+		int end = (i+winSize)<=BAND_NUM?(i+winSize):BAND_NUM;
+		for(int j = start; j <= end; j++){
+			float cost = myabs((float)array1[i-1],array2[j-1]);
+			mat[i][j]= cost + minTriple(mat[i-1][j],mat[i][j-1],mat[i-1][j-1]);
+		}
+	}
+	
+	return mat[BAND_NUM ][BAND_NUM ];
+}
+
+/* 
+ * Discrete Frechet distance(input type uchar)
+ */
+__device__ float frechet(uchar *array1, float *array2, float mat[][BAND_NUM]){
+	for(int i = 1; i < BAND_NUM; i++){
+		for(int j = 1; j < BAND_NUM; j++){
+			mat[i][j] = -1.0;
+		}
+	}
+
+	mat[0][0] = myabs((float)array1[0], array2[0]);
+
+	for(int i = 1; i < BAND_NUM; i++)
+		mat[i][0] = mymax(mat[i-1][0], myabs((float)array1[i], array2[0]));
+
+	for(int j = 1; j < BAND_NUM; j++)
+		mat[0][j] = mymax(mat[0][j-1], myabs((float)array1[0], array2[j]));
+
+	for(int i = 1; i < BAND_NUM; i++){
+		for(int j = 1; j < BAND_NUM; j++){
+			mat[i][j] = mymax(minTriple(mat[i-1][j],mat[i-1][j-1],mat[i][j-1]), myabs((float)array1[i], array2[j]));
+		}
+	}
+
+	return mat[BAND_NUM-1][BAND_NUM-1];
+}
+
+/*
+ * The K-nearest neighbor algorithm in CUDA
+ */
+__device__ int getNeighbors(uchar *test, float *train, int *labels, int distId){
+	float distances[SAMPLE_SIZE] = {0};
+
+
+	// loop through the training data, compute the distance between training data and testing data
+	for(int i = 0; i < SAMPLE_SIZE; i++){
+		int idx = i * BAND_NUM;
+		switch(distId){
+				case 1:
+					distances[i] = euclideanDist(test, train + idx, BAND_NUM);;
+					break;
+				case 2:
+					float mat1[BAND_NUM + 1][BAND_NUM + 1];
+					distances[i] = dtw(test, train + idx, mat1, 1);
+					break;
+				case 3:
+					float mat2[BAND_NUM][BAND_NUM];
+					distances[i] = frechet(test, train + idx, mat2);
+					break;
+				default:
+					break;
+		}
+	}
+
+	// define the first k neighors label variable
+	int klabels[KN]={0};
+
+	// find the first k neighor labels
+	for(int i=0;i<KN;i++){
+		int index = 0;
+		// loop through the computed distance array to find the k nearest distances
+		for(int j=1;j<SAMPLE_SIZE;j++)
+			if(distances[index]>distances[j])
+				index = j;
+		// find the label of the corresponding distance
+		klabels[i]=labels[index];
+		// set the distance of that index to infinity to avoid picking it again at next loop
+		distances[index]=FLT_MAX;
+	}
+
+	// define the variable to count the occurrence times of each label in the k nearest neighbors
+	int classVotes[MAX_CLUSTERS]={0};
+	for(int i=0;i<KN;i++)
+		classVotes[klabels[i]-1]+=1;
+
+	// find the maxCount in these labels
+	int maxCount = 0;
+	for(int i=0;i<MAX_CLUSTERS;i++){
+		if(classVotes[i]>maxCount){
+			maxCount = classVotes[i];
+		}
+	}
+	
+	// mark the occurence times of some label equal to maxCount as 1
+	for(int i=0;i<MAX_CLUSTERS;i++){
+		if(classVotes[i]==maxCount)
+			classVotes[i]=1;
+		else
+			classVotes[i]=0;
+	}
+
+	// return the first label which is in the set of the marked labels from the k nearest neighbor labels
+	for(int i=0;i<KN;i++){
+		if(classVotes[klabels[i]-1]==1)
+			return klabels[i];
+	}
+	return 0;
+}
+
+__global__ void labelPixels(uchar *f1, uchar *f2, float *sample, int *label, uchar *out, int *labeltable, int distId, int nthreads){
+
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if(i<nthreads)
+	{
+		int idx = BAND_NUM * i;
+		int label1 = getNeighbors(f1 + idx, sample, label, distId);
+		int label2 = getNeighbors(f2 + idx, sample, label, distId);
+		int changes = 0;
+
+		for(int m = 0; m < (MAX_CLUSTERS - MIN_CLUSTERS + 1); m++){
+			
+			int newlabel1 = labeltable[(label1 - 1)*(MAX_CLUSTERS - MIN_CLUSTERS + 1)+m];
+			int newlabel2 = labeltable[(label2 - 1)*(MAX_CLUSTERS - MIN_CLUSTERS + 1)+m];
+			if(newlabel1 != newlabel2)
+				changes += 1;
+		}
+
+		out[i] = (uchar)changes;
+		/*
+		if(label1 == label2)
+		{
+			out[i] = (uchar)0;
+		}
+		else
+		{
+			out[i] = (uchar)1;
+		}
+		*/
+	}
+}
+
+
+int main()
+{
+	// record the start time of the program
+	clock_t begin = clock();
+
+	// time to malloc in GPU
+	double mallocTimer = 0.0;
+	clock_t mallocBegin;
+	clock_t mallocEnd;
+
+	// time transfer data between host and device 
+	double transferTimer = 0.0;
+	clock_t transferBegin;
+	clock_t transferEnd;
+
+	// time the CUDA kernel function runs
+	double kernelTimer = 0.0;
+	clock_t kernelBegin;
+	clock_t kernelEnd;
+
+	// change percentile
+	int changeMap[MAX_CLUSTERS-MIN_CLUSTERS+2] = {0};
+
+	// set the flag for the hierarchical clustering
+	bool hierarchy = true;
+
+	// set the current time as the random sampling seed 
+	srand(time(NULL));
+	//srand(1);
+
+	// create the sampling array
+	float *sample = new float[SAMPLE_SIZE * BAND_NUM];
+
+	// create the labels array
+	int *label = new int[SAMPLE_SIZE];
+
+	// possible label table
+	int *labelTable = new int[MAX_CLUSTERS * (MAX_CLUSTERS-MIN_CLUSTERS+1)];
+
+	// the size of the file we read
+	size_t file_len = FILE_SIZE;
+	// the actual size of the data which is read each time
+	size_t read_len = 0;
+	// the start point that we read the data each time
+	ulint page_start=0;
+
+	// allocate memory to the f1 data in the host
+	//uchar *f1 = new uchar[MMAP_SIZE];
+	uchar *f1 = new uchar[FILE_SIZE];
+
+	// allocate memory to the f1 data in the host
+	//uchar *f2 = new uchar[MMAP_SIZE];
+	uchar *f2 = new uchar[FILE_SIZE];
+
+	// allocate memory to the output array in the host
+	uchar *out  = new uchar[MMAP_SIZE/BAND_NUM];
+	if(!f1 || !f2 || !out || !sample || !label || !labelTable){
+		cout << "The dynamic memory can not be alloclated in the host" << endl;
+		if(f1)
+			delete [] f1;
+		if(f2)
+			delete [] f2;
+		if(out)
+			delete [] out;
+		if(sample)
+			delete [] sample;
+		if(label)
+			delete [] label;
+		if(labelTable)
+			delete [] labelTable;
+		exit(EXIT_FAILURE);
+	}
+	
+	mallocBegin = clock();
+
+	// use to test the error of the CUDA commands
+	cudaError_t err = cudaSuccess;
+
+	// allocate memory for the f1 in CUDA
+	uchar *d_f1Array = NULL;
+	err = cudaMalloc(&d_f1Array, sizeof(uchar) * MMAP_SIZE);
+	if( err != cudaSuccess){
+		fprintf(stderr, "Failed to allocate device file1 array (error code %s)!\n", cudaGetErrorString(err));
+		exit(EXIT_FAILURE);
+	}
+
+	// allocate memory for the f2 in CUDA
+	uchar *d_f2Array = NULL;
+	err = cudaMalloc(&d_f2Array, sizeof(uchar) * MMAP_SIZE);
+	if(err != cudaSuccess){
+		fprintf(stderr, "Failed to allocate device file2 array (error code %s)!\n", cudaGetErrorString(err));
+		exit(EXIT_FAILURE);
+	}
+
+	// allocate memory for the output array in CUDA
+	uchar *d_outArray = NULL;
+	err = cudaMalloc(&d_outArray, sizeof(uchar) * (MMAP_SIZE/BAND_NUM));
+	if(err != cudaSuccess){
+		fprintf(stderr, "Failed to allocate device output array (error code %s)!\n", cudaGetErrorString(err));
+		exit(EXIT_FAILURE);
+	}
+
+	// allocate memory for the sample array in CUDA
+	float *d_sampleArray = NULL;
+	err = cudaMalloc(&d_sampleArray, sizeof(float) * (SAMPLE_SIZE * BAND_NUM));
+	if(err != cudaSuccess){
+		fprintf(stderr, "Failed to allocate device sample array (error code %s)!\n", cudaGetErrorString(err));
+		exit(EXIT_FAILURE);
+	}
+
+	// allocate memory for the sample array in CUDA
+	int *d_labelArray = NULL;
+	err = cudaMalloc(&d_labelArray, sizeof(int) * SAMPLE_SIZE);
+	if(err != cudaSuccess){
+		fprintf(stderr, "Failed to allocate device label array (error code %s)!\n", cudaGetErrorString(err));
+		exit(EXIT_FAILURE);
+	}
+
+	int *d_labelTable = NULL;
+	err = cudaMalloc(&d_labelTable, sizeof(int) * MAX_CLUSTERS * (MAX_CLUSTERS-MIN_CLUSTERS+1));
+	if(err != cudaSuccess){
+		fprintf(stderr, "Failed to allocate device label table (error code %s)!\n", cudaGetErrorString(err));
+		exit(EXIT_FAILURE);
+	}
+	mallocEnd = clock();
+	mallocTimer += double(mallocEnd - mallocBegin) / CLOCKS_PER_SEC;
+
+
+	// set the start point where to write the data;
+	int count = 0;
+
+	// read the corresponding part of the data from image1 and image2
+	//readRawFile(FILE1_PATH,f1,page_start,read_len);
+	//readRawFile(FILE2_PATH,f2,page_start,read_len);
+	readRawFile(FILE1_PATH,f1,0,FILE_SIZE);
+	readRawFile(FILE2_PATH,f2,0,FILE_SIZE);
+
+	//print the reading results
+		
+	for(int i = 0; i < 20; i++){
+		cout << (float)f1[i]<< " ";
+	}
+	cout << endl;
+	for(int i = 0; i < 20; i++){
+		cout << (float)f2[i] << " ";
+	}
+	cout << endl;
+
+	// the number of pixels processed each time
+	//int maxRange = read_len/BAND_NUM;
+	int maxRange = FILE_SIZE/BAND_NUM;
+
+	// sampling and hierarchical clustering
+	if(hierarchy){
+		
+		for(int i = 0; i < SAMPLE_SIZE ;i+=2){
+			int randomNum = rand() % maxRange;
+			for(int j = 0; j < BAND_NUM; j++){
+				sample[i * BAND_NUM + j] = (float)f1[randomNum * BAND_NUM + j];
+				sample[(i + 1) * BAND_NUM + j] = (float)f2[randomNum * BAND_NUM + j];
+			}
+		}
+
+		item_t *items = NULL;
+		int num_items = SAMPLE_SIZE;
+		items = read_data(num_items, sample);
+		set_linkage('w');
+		if (num_items) {
+			cluster_t *cluster = agglomerate(num_items, items);
+			free(items);
+
+			if (cluster) {
+				int k = MAX_CLUSTERS;
+				unordered_map<int, int> mymap;
+				//fprintf(stdout, "\n\n%d CLUSTERS\n--------------------\n", k);
+				get_k_clusters(cluster, k, label);
+				for(int i = 0; i < SAMPLE_SIZE && mymap.size() < MAX_CLUSTERS; i++){
+					if( mymap.find(label[i]) == mymap.end() ){
+						mymap[label[i]] = i;
+					}
+				}
+
+				for(k = MIN_CLUSTERS; k <= MAX_CLUSTERS; k++){
+					get_k_clusters(cluster, k, label);
+					for(int j = 0; j < MAX_CLUSTERS; j++ )
+						labelTable[j * (MAX_CLUSTERS - MIN_CLUSTERS + 1) + k - MIN_CLUSTERS] = label[mymap[j + 1]];
+					//for(int i=0; i < SAMPLE_SIZE; i++){
+						//cout << i+1 << ": " << label[i] << endl;
+					//}
+				}
+
+				
+				for(int i = 0; i < MAX_CLUSTERS; i++){
+					for(int j = 0; j < MAX_CLUSTERS - MIN_CLUSTERS + 1; j++){
+						cout << labelTable[ i * (MAX_CLUSTERS - MIN_CLUSTERS + 1) + j] << " ";
+					}
+					cout << endl;
+				}
+				
+				/*
+				for(int i=0; i < SAMPLE_SIZE; i++){
+					cout << i+1 << ": " << label[i] << endl;
+				}
+				*/
+				free(cluster);
+
+			}
+		}
+		// the time that the tranfer begins
+		transferBegin = clock();
+		err = cudaMemcpy(d_sampleArray, sample, sizeof(float) * (SAMPLE_SIZE * BAND_NUM), cudaMemcpyHostToDevice);
+		if(err != cudaSuccess){
+			fprintf(stderr, "Failed to copy sample array from host to device (error code %s)!\n", cudaGetErrorString(err));
+			exit(EXIT_FAILURE);
+		}
+
+		err = cudaMemcpy(d_labelArray, label, sizeof(int) * SAMPLE_SIZE, cudaMemcpyHostToDevice);
+		if(err != cudaSuccess){
+			fprintf(stderr, "Failed to copy sample array from host to device (error code %s)!\n", cudaGetErrorString(err));
+			exit(EXIT_FAILURE);
+		}
+
+		err = cudaMemcpy(d_labelTable, labelTable, sizeof(int) * MAX_CLUSTERS * (MAX_CLUSTERS-MIN_CLUSTERS+1), cudaMemcpyHostToDevice);
+		if(err != cudaSuccess){
+			fprintf(stderr, "Failed to copy label table from host to device (error code %s)!\n", cudaGetErrorString(err));
+			exit(EXIT_FAILURE);
+		}
+		// the transfer done
+		transferEnd = clock();
+		transferTimer += double(transferEnd - transferBegin) / CLOCKS_PER_SEC;
+
+		hierarchy = false;
+	}
+
+	while(file_len > 0){
+		// determine the amount of data which is read at this time
+		if(file_len > MMAP_SIZE){
+			read_len = (size_t)MMAP_SIZE;
+			file_len -= MMAP_SIZE;
+			//cout << actualreadlen << " " << readlen << " " << MMAP_SIZE << endl; 
+		}
+		else{
+			read_len = file_len;
+			file_len = 0;
+		}
+
+		// number of CUDA threads needed
+		int nthreads = read_len/BAND_NUM;
+		int nblocks = nthreads%CUDA_THREAD_PER_BLOCK==0?(nthreads/CUDA_THREAD_PER_BLOCK):(nthreads/CUDA_THREAD_PER_BLOCK+1);
+
+		// tranfer begins again
+		cout << "The transfer begins!!" << endl;
+		transferBegin = clock();
+		// copy the f1 array from host to device
+		err = cudaMemcpy(d_f1Array, f1 + page_start, read_len * sizeof(uchar), cudaMemcpyHostToDevice);
+		if(err != cudaSuccess){
+			fprintf(stderr, "Failed to copy file 1 from host to device (error code %s)!\n", cudaGetErrorString(err));
+			exit(EXIT_FAILURE);
+		}
+
+		// copy the f2 array from host to device
+		err = cudaMemcpy(d_f2Array, f2 + page_start, read_len * sizeof(uchar), cudaMemcpyHostToDevice);
+		if(err != cudaSuccess){
+			fprintf(stderr, "Failed to copy file 2 from host to device (error code %s)!\n", cudaGetErrorString(err));
+			exit(EXIT_FAILURE);
+		}
+		transferEnd = clock();
+		transferTimer += double(transferEnd - transferBegin) / CLOCKS_PER_SEC;
+
+		// do the calculation
+		cout << "Begin calculation!" << endl;
+		kernelBegin = clock();
+		labelPixels<<<nblocks, CUDA_THREAD_PER_BLOCK>>>(d_f1Array, d_f2Array, d_sampleArray, d_labelArray, d_outArray, d_labelTable, DIST_ID, nthreads);
+		cudaDeviceSynchronize();
+		kernelEnd = clock();
+		kernelTimer += double(kernelEnd - kernelBegin) / CLOCKS_PER_SEC;
+		cout << "Finish calculation!" << endl;
+
+		// transfer the output array back from device to host
+		transferBegin = clock();
+		err = cudaMemcpy(out, d_outArray, nthreads * sizeof(uchar), cudaMemcpyDeviceToHost);
+		if(err != cudaSuccess){
+			fprintf(stderr, "Failed to copy output from device to host (error code %s)!\n", cudaGetErrorString(err));
+			exit(EXIT_FAILURE);
+		}
+		transferEnd = clock();
+		transferTimer += double(transferEnd - transferBegin) / CLOCKS_PER_SEC;
+
+		cout << "The transfer is done!!" << endl;
+
+		for(int i = 0; i < nthreads; i++){
+			changeMap[(int)out[i]] += 1;
+		}
+
+		writeData(out, count, OUT_COL_NUM, OUT_PATH, nthreads);
+
+		// move the start pointer to prepare the reading if the images next time
+		page_start += read_len;
+	}
+
+	// free all the memory allocated before exiting the program
+	if(f1)
+		delete [] f1;
+	if(f2)
+		delete [] f2;
+	if(out)
+		delete [] out;
+	if(sample)
+		delete [] sample;
+	if(label)
+		delete [] label;
+	if(labelTable)
+		delete [] labelTable;
+	if(d_f1Array)
+		cudaFree(d_f1Array);
+	if(d_f2Array)
+		cudaFree(d_f2Array);
+	if(d_outArray)
+		cudaFree(d_outArray);
+	if(d_sampleArray)
+		cudaFree(d_sampleArray);
+	if(d_labelArray)
+		cudaFree(d_labelArray);
+	if(d_labelTable)
+		cudaFree(d_labelTable);
+
+	for(int i = MAX_CLUSTERS - MIN_CLUSTERS; i >= 1; i--)
+		changeMap[i] = changeMap[i] + changeMap[i + 1];
+
+	for(int i = MAX_CLUSTERS - MIN_CLUSTERS + 1; i >= 0 ; i--){
+		cout << "The " << i << " Level change percentile: " << (float)changeMap[i]/(FILE_SIZE/BAND_NUM) << endl;
+
+	}
+
+	clock_t end = clock();
+	double elapsed_secs1 = double(end - begin) / CLOCKS_PER_SEC;
+	printf("\nThe data tranfter between host and device time: %f", transferTimer);
+	printf("\nThe kernel call in CUDA running time: %f", kernelTimer);
+	printf("\nThe memory malloc in CUDA time: %f", mallocTimer);
+	printf("\nElapsed Time: %f\n",elapsed_secs1);
+
+	return 0;
+}
+
