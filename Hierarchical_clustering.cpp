@@ -39,11 +39,15 @@ float themax(float a, float b){
  */
 float dtw(const coord_t *a, const coord_t *b, float mat[][BAND_NUM+1], int winSize){
 
-	for(int i = 0; i <= BAND_NUM; i++){
-	    for(int j = 0; j <= BAND_NUM; j++){
-	        mat[i][j]=FLT_MAX;
-	    }
-	}
+    for(int i = 0; i <= 1 + winSize; i++){
+        mat[0][i] = FLT_MAX;
+        mat[i][0] = FLT_MAX;
+    }   
+
+    for(int i = 2 + winSize; i <= BAND_NUM; i++){
+        mat[i - winSize -1][i] = FLT_MAX;
+        mat[i][i - winSize - 1] = FLT_MAX;
+    }
 
     mat[0][0] = 0;
 	
