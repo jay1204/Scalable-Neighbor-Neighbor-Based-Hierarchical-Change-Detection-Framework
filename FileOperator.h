@@ -29,8 +29,11 @@
 using namespace std;
 
 #define FILE1_PATH "./MODIS data/s_2001.raw"
+//#define FILE2_PATH "./MODIS data/s_2006.raw"
 #define FILE2_PATH "./MODIS data/s_2006.raw"
-#define OUT_PATH "./MODIS data/s_2001_2006_out_parallel.txt"
+//#define OUT_PATH "./MODIS data/s_2001_2006_out_parallel.txt"
+#define OUT_PATH "./MODIS data/s_2001_2006_out_parallel_1.txt"
+
 
 #define MAX_CLUSTERS 8
 #define MIN_CLUSTERS 2
@@ -45,7 +48,7 @@ using namespace std;
 #define EUCLIDEAN 1
 #define DTW 2
 #define FRECHET 3
-#define DIST_ID EUCLIDEAN 
+#define DIST_ID EUCLIDEAN
 #define KN 9
 
 // MMAP_SIZE must be a multiplier of 64KB(65536) and a multiplier of 23, now it is a multiplier of 1024*64*176*23
