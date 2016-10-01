@@ -19,5 +19,5 @@ Hardware: CUDA enabled Graphical card, Main Memory >= 8 GB
 
 ## The Change Detection Result
 Inline-style: 
-![alt text]()
+![alt text](https://github.com/jay1204/Scalable-Neighbor-Neighbor-Based-Hierarchical-Change-Detection-Framework/blob/master/ChangeMap.PNG)
 
