@@ -11,6 +11,7 @@ The detailed description of the algorithm is in the ChangeDetection ppt slides. 
 
 ## Prerequisites for running the program
 Hardware: CUDA enabled Graphical card, Main Memory >= 8 GB
+Library: CUDA library installed
 
 ## Run the code
 1. make file
