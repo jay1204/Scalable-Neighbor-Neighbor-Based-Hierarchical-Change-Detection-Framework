@@ -10,7 +10,7 @@ The algorithm implementation is written in c++ with CUDA to accelerate the compu
 The detailed description of the algorithm is in the ChangeDetection ppt slides. For detailed information, please contact me(zchen22@ncsu.edu).
 
 ## Prerequisites for running the program
-Hardware: CUDA enabled Graphical card, Main Memory >= 8 GB
+Hardware: CUDA enabled Graphical card, Main Memory >= 8 GB  
 Library: CUDA library installed
 
 ## Run the code
